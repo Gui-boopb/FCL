@@ -328,23 +328,39 @@
         const FIREBASE_URL = "https://sistema-fcl-default-rtdb.firebaseio.com/"; 
 
         // Inicialização Core
-        firebase.initializeApp({ databaseURL: FIREBASE_URL });
+        if (!firebase.apps.length) {
+            firebase.initializeApp({ databaseURL: FIREBASE_URL });
+        }
         const db = firebase.database();
 
         let bd = { eventos: [], barracas: [], produtos: [], cartoes: [], transacoes: [] };
+        let cacheCartoes = {};
+        let cacheBarracas = {};
+        let cacheProdutos = {};
         let eventoAtivo = null; let barracaAtivaId = null; let authMode = "caixa"; let carrinho = [];
         let html5QrCode = null; let activeScannerContainerId = null; let graficoFaturamento = null;
+        let saldoCheckTimeout = null;
+        let pdvRenderTimeout = null;
 
         window.onload = () => {
-            if (localStorage.getItem('fcl_session_evento')) {
-                eventoAtivo = JSON.parse(localStorage.getItem('fcl_session_evento'));
-                if (localStorage.getItem('fcl_admin_enabled') === 'true') {
-                    document.getElementById('btn-nav-admin').style.display = 'flex';
-                    document.getElementById('btn-nav-dash').style.display = 'flex';
-                }
-                configurarTelaLogada();
-            }
             sincronizarBancoOtimizado();
+
+            const sessao = localStorage.getItem('fcl_session_evento');
+            if (sessao) {
+                try {
+                    eventoAtivo = JSON.parse(sessao);
+
+                    if (localStorage.getItem('fcl_admin_enabled') === 'true') {
+                        document.getElementById('btn-nav-admin').style.display = 'flex';
+                        document.getElementById('btn-nav-dash').style.display = 'flex';
+                    }
+
+                    configurarTelaLogada();
+                } catch(e) {
+                    console.error('Erro ao restaurar sessão:', e);
+                    localStorage.removeItem('fcl_session_evento');
+                }
+            }
         };
 
         // ==========================================
@@ -356,20 +372,38 @@
             
             // Ouvintes independentes reduzem o uso de dados em 90% em transações simultâneas
             db.ref("eventos").on("value", s => { bd.eventos = s.val() ? Object.values(s.val()) : []; atualizarInterfaceCore(); });
-            db.ref("barracas").on("value", s => { bd.barracas = s.val() ? Object.values(s.val()) : []; atualizarInterfaceCore(); });
-            db.ref("produtos").on("value", s => { bd.produtos = s.val() ? Object.values(s.val()) : []; atualizarInterfaceCore(); });
+            db.ref("barracas").on("value", s => { 
+                bd.barracas = s.val() ? Object.values(s.val()) : [];
+                cacheBarracas = {};
+                bd.barracas.forEach(b => cacheBarracas[b.id] = b);
+                atualizarInterfaceCore(); 
+            });
+
+            db.ref("produtos").on("value", s => { 
+                bd.produtos = s.val() ? Object.values(s.val()) : [];
+                cacheProdutos = {};
+                bd.produtos.forEach(p => cacheProdutos[p.id] = p);
+                atualizarInterfaceCore(); 
+            });
             
             // Cartões atualizam o visor de saldo do PDV instantaneamente
             db.ref("cartoes").on("value", s => { 
                 bd.cartoes = s.val() ? Object.values(s.val()) : []; 
+                
+                cacheCartoes = {};
+                bd.cartoes.forEach(c => {
+                    cacheCartoes[c.id_cartao] = c;
+                });
+
                 verificarSaldoPDV(); 
-                atualizarInterfaceCore();
             });
             
             // Transações só repintam o dash se ele estiver aberto
-            db.ref("transacoes").on("value", s => { 
+            db.ref("transacoes").limitToLast(3000).on("value", s => { 
                 bd.transacoes = s.val() ? Object.values(s.val()) : []; 
-                if(document.getElementById('tab-dash').classList.contains('active')) processarDadosDashboard();
+                if(document.getElementById('tab-dash').classList.contains('active')) {
+                    processarDadosDashboard();
+                }
             });
             
             setTimeout(() => setBadge(false), 1500); // Esconde badge após cargas iniciais
@@ -443,7 +477,9 @@
         }
 
         function logout() {
-            eventoAtivo = null; localStorage.clear();
+            eventoAtivo = null;
+            localStorage.removeItem('fcl_session_evento');
+            localStorage.removeItem('fcl_admin_enabled');
             location.reload();
         }
 
@@ -476,7 +512,16 @@
         }
 
         function pararLeitorCamera(vId, cId) {
-            if (html5QrCode) { html5QrCode.stop().then(() => { html5QrCode.clear(); html5QrCode = null; }).catch(()=>{}); }
+            if (html5QrCode) { 
+                html5QrCode.stop()
+                    .then(() => { 
+                        html5QrCode.clear(); 
+                        html5QrCode = null; 
+                    })
+                    .catch(() => { 
+                        html5QrCode = null; 
+                    }); 
+            }
             document.getElementById(cId).style.display = 'none';
             activeScannerContainerId = null;
         }
@@ -491,6 +536,8 @@
         // VERIFICAR SALDO NO PDV
         // ==========================================
         function verificarSaldoPDV() {
+            clearTimeout(saldoCheckTimeout);
+            saldoCheckTimeout = setTimeout(() => {
             let id = document.getElementById('pdv-card-id').value.toUpperCase().trim();
             let box = document.getElementById('pdv-visor-saldo');
             let txt = document.getElementById('pdv-valor-saldo');
@@ -503,7 +550,7 @@
                 return;
             }
             
-            let card = bd.cartoes.find(c => c.id_cartao === id);
+            let card = cacheCartoes[id] || bd.cartoes.find(c => c.id_cartao === id);
             if(card) {
                 let s = parseFloat(card.saldo);
                 txt.innerText = `R$ ${s.toFixed(2)}`;
@@ -514,6 +561,7 @@
                 box.classList.add('no-saldo');
                 txt.style.color = "var(--warning)";
             }
+            }, 150);
         }
 
         // ==========================================
@@ -559,7 +607,12 @@
                     labels: labels,
                     datasets: [{ label: 'Faturamento (R$)', data: dados, backgroundColor: '#6366f1', borderRadius: 8 }]
                 },
-                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
+                options: { 
+                    responsive: true, 
+                    maintainAspectRatio: false,
+                    animation: false,
+                    plugins: { legend: { display: false } }
+                }
             });
         }
 
@@ -639,7 +692,7 @@
         function executarConsultaSaldo() {
             let id = document.getElementById('caixa-card-id').value.toUpperCase().trim();
             if(!id) return showToast("Insira ou Bipe o ID do cartão.", "warning");
-            let card = bd.cartoes.find(c => c.id_cartao === id);
+            let card = cacheCartoes[id] || bd.cartoes.find(c => c.id_cartao === id);
             
             document.getElementById('display-saldo-valor').innerText = `R$ ${card ? parseFloat(card.saldo).toFixed(2) : '0.00'}`;
             document.getElementById('display-saldo-valor').style.color = card ? 'var(--success)' : 'var(--text-muted)';
@@ -651,7 +704,7 @@
             let id = document.getElementById('caixa-card-id').value.toUpperCase().trim();
             if(!id) return showToast("Por favor, consulte um cartão primeiro.", "warning");
             
-            let card = bd.cartoes.find(c => c.id_cartao === id);
+            let card = cacheCartoes[id] || bd.cartoes.find(c => c.id_cartao === id);
             let saldoAtual = (card && card.saldo) ? parseFloat(card.saldo) : 0;
 
             if(saldoAtual <= 0) return showToast("Este cartão já está zerado ou inativo.", "warning");
@@ -678,7 +731,7 @@
 
             cardRef.transaction((cardData) => {
                 let saldoAtual = (cardData && cardData.saldo) ? parseFloat(cardData.saldo) : 0;
-                if (tipoMov === "Estorno" && saldoAtual < valor) return; // Rejeita se não tiver saldo
+                if (tipoMov === "Estorno" && saldoAtual < valor) return null; // Rejeita se não tiver saldo
                 let novoSaldo = tipoMov === "Recarga" ? (saldoAtual + valor) : (saldoAtual - valor);
                 return { id_cartao: id, saldo: novoSaldo, updated_at: new Date().toISOString() };
                 
@@ -691,17 +744,26 @@
                 } else if (!committed) {
                     showToast("Operação Recusada! Saldo insuficiente para estorno.", "error");
                 } else {
-                    const transacaoId = 'TX-' + Date.now();
+                    const transacaoId = db.ref().push().key;
                     db.ref('transacoes/' + transacaoId).set({
                         id: transacaoId, evento_id: eventoAtivo.id, barraca_id: "CAIXA_CENTRAL", 
                         cartao_id: id, tipo: tipoMov, valor: valor, detalhes: `Operação de ${tipoMov}`, data: new Date().toISOString()
                     });
 
+                    const novoSaldo = snapshot && snapshot.val() ? parseFloat(snapshot.val().saldo || 0) : 0;
+
+                    document.getElementById('display-saldo-valor').innerText = `R$ ${novoSaldo.toFixed(2)}`;
+                    document.getElementById('display-saldo-valor').style.color = novoSaldo > 0 ? 'var(--success)' : 'var(--text-muted)';
+                    document.getElementById('display-saldo-id').innerText = `💳 CARTÃO: ${id}`;
+                    document.getElementById('display-resultado-consulta').style.display = 'flex';
+
                     document.getElementById('caixa-card-id').value = '';
                     document.getElementById('caixa-valor').value = '';
-                    executarConsultaSaldo(); // Atualiza a tela preta com o novo valor
                     
-                    setTimeout(() => { document.getElementById('display-resultado-consulta').style.display = 'none'; }, 4000);
+                    setTimeout(() => { 
+                        document.getElementById('display-resultado-consulta').style.display = 'none'; 
+                    }, 4000);
+
                     showToast(`${tipoMov} de R$ ${valor.toFixed(2)} concluída com sucesso!`, "success");
                 }
             });
@@ -727,6 +789,9 @@
         }
 
         function renderPDV(filtro = "") {
+            clearTimeout(pdvRenderTimeout);
+
+            pdvRenderTimeout = setTimeout(() => {
             const grid = document.getElementById('lista-produtos-pdv');
             let itens = bd.produtos.filter(p => p.barraca_id === barracaAtivaId);
             if(filtro) itens = itens.filter(p => p.nome.toLowerCase().includes(filtro.toLowerCase()));
@@ -747,13 +812,16 @@
                     <strong style="color:var(--accent); font-size:15px;">R$ ${precoValid.toFixed(2)}</strong>
                 </div>`;
             }).join('');
+
+            }, 40);
         }
 
         function addAoCarrinho(id, nome, preco) {
             let ex = carrinho.find(c => c.id === id);
             if(ex) ex.qtd++; else carrinho.push({id, nome, preco, qtd: 1});
             atualizarCarrinho();
-            renderPDV(document.querySelector('.input-control[placeholder="🔍 Filtrar cardápio..."]').value);
+            const filtroInput = document.querySelector('.input-control[placeholder="🔍 Filtrar cardápio..."]');
+            renderPDV(filtroInput ? filtroInput.value : "");
         }
 
         function atualizarCarrinho() {
@@ -772,20 +840,25 @@
             carrinho[index].qtd--;
             if(carrinho[index].qtd <= 0) carrinho.splice(index, 1);
             atualizarCarrinho();
-            renderPDV(document.querySelector('.input-control[placeholder="🔍 Filtrar cardápio..."]').value);
+            const filtroInput = document.querySelector('.input-control[placeholder="🔍 Filtrar cardápio..."]');
+            renderPDV(filtroInput ? filtroInput.value : "");
         }
 
         function limparCarrinho() {
             carrinho = []; atualizarCarrinho(); renderPDV();
         }
 
+        let vendaEmProcessamento = false;
+
         function finalizarVenda() {
+            if(vendaEmProcessamento) return;
             let id = document.getElementById('pdv-card-id').value.toUpperCase().trim();
             let tot = carrinho.reduce((a, b) => a + (b.preco * b.qtd), 0);
             
             if(!id) return showToast("Bipe ou digite o cartão do cliente.", "warning");
             if(tot <= 0) return showToast("Adicione produtos ao carrinho.", "warning");
             
+            vendaEmProcessamento = true;
             bloquearBotao('btn-finalizar-venda', true);
             setBadge(true);
 
@@ -793,10 +866,11 @@
 
             cardRef.transaction((cardData) => {
                 let saldoAtual = (cardData && cardData.saldo) ? parseFloat(cardData.saldo) : 0;
-                if (saldoAtual < tot) return;
+                if (saldoAtual < tot) return null;
                 return { id_cartao: id, saldo: saldoAtual - tot, updated_at: new Date().toISOString() };
                 
             }, (error, committed, snapshot) => {
+                vendaEmProcessamento = false;
                 bloquearBotao('btn-finalizar-venda', false);
                 setBadge(false);
 
@@ -806,7 +880,7 @@
                     showToast(`VENDA RECUSADA! Saldo insuficiente.`, "error");
                 } else {
                     let str = carrinho.map(c => `${c.qtd}x ${c.nome}`).join(', ');
-                    const txId = 'TX-' + Date.now();
+                    const txId = db.ref().push().key;
                     db.ref('transacoes/' + txId).set({
                         id: txId, evento_id: eventoAtivo.id, barraca_id: barracaAtivaId, 
                         cartao_id: id, tipo: "Venda", valor: tot, detalhes: str, data: new Date().toISOString()
@@ -828,7 +902,7 @@
             let gerando = true;
             
             while(gerando) {
-                cardId = `${prefixo}-${Math.floor(Math.random() * 90000 + 10000)}`;
+                cardId = `${prefixo}-${Date.now()}-${Math.floor(Math.random() * 90000 + 10000)}`;
                 let existeNoBanco = bd.cartoes.some(c => c.id_cartao === cardId);
                 let existeNoLote = idsGeradosNestaSessao.includes(cardId);
                 
@@ -870,6 +944,15 @@
             boxPreview.style.display = 'block';
             showToast(`${qtd} cartões gerados e verificados contra duplicidade.`, "success");
         }
-    </script>
+    
+        window.addEventListener('offline', () => {
+            showToast('Você está sem internet.', 'error');
+        });
+
+        window.addEventListener('online', () => {
+            showToast('Conexão restaurada.', 'success');
+        });
+
+</script>
 </body>
 </html>
